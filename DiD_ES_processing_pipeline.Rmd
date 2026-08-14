@@ -1,0 +1,743 @@
+---
+title: "GY460_A1_pipeline"
+author: "Kai"
+date: "2026-06-09"
+output: html_document
+---
+
+```{r setup, include=FALSE, echo=FALSE, message = FALSE, warning = FALSE}
+library(data.table)
+library(dplyr)
+library(sf)
+library(fixest)
+library(lubridate)
+library(ggplot2)
+library(stringr)
+library(readr)
+library(data.table)
+```
+
+```{r path}
+gardens <- st_read("C:/LSE_GEOGRAPHY/GY_460/A1/final_17_community_gardens.gpkg")
+
+garden300 <- st_buffer(gardens, 300)
+garden1000 <- st_buffer(gardens, 1000)
+
+study_area <- st_union(garden1000)
+
+buffer300_union <- st_union(garden300)
+buffer1000_union <- st_union(garden1000)
+
+garden_ring <- garden1000
+
+st_geometry(garden_ring) <- do.call(
+  c,
+  lapply(
+    seq_len(nrow(garden1000)),
+    function(i) {
+      st_difference(
+        st_geometry(garden1000[i, ]),
+        st_geometry(garden300[i, ])
+      )
+    }
+  )
+)
+
+control_ring <- st_difference(
+  buffer1000_union,
+  buffer300_union
+)
+
+onspd <- fread(
+  "C:/Users/User/Downloads/ONSPD_FEB_2025/Data/ONSPD_FEB_2025_UK.csv",
+  select = c(
+    "pcds",
+    "oseast1m",
+    "osnrth1m",
+    "lsoa11",
+    "lsoa21"
+  )
+)
+
+cols <- c(
+  "transaction_id",
+  "price",
+  "transfer_date",
+  "postcode",
+  "property_type",
+  "old_new",
+  "duration",
+  "paon",
+  "saon",
+  "street",
+  "locality",
+  "town_city",
+  "district",
+  "county",
+  "category_type",
+  "record_status"
+)
+
+```
+
+
+```{r processing_function}
+process_year <- function(year) {
+  
+  cat("Processing", year, "\n")
+
+  file <- paste0(
+    "C:/LSE_GEOGRAPHY/GY_460/A1/transaction data/pp-",
+    year,
+    ".csv"
+  )
+
+  ppd <- fread(
+    file,
+    header = FALSE,
+    col.names = cols
+  )
+
+  ppd <- ppd[county == "GREATER LONDON"]
+
+  ppd_geo <- merge(
+    ppd,
+    onspd,
+    by.x = "postcode",
+    by.y = "pcds",
+    all.x = TRUE
+  )
+
+  ppd_geo <- ppd_geo[
+    !is.na(oseast1m) &
+    !is.na(osnrth1m)
+  ]
+
+  transactions_sf <- st_as_sf(
+    ppd_geo,
+    coords = c("oseast1m","osnrth1m"),
+    crs = 27700
+  )
+
+  transactions_sf <- transactions_sf[
+    st_intersects(
+      transactions_sf,
+      study_area,
+      sparse = FALSE
+    ),
+  ]
+
+  transactions_sf$treat300 <-
+    as.integer(
+      lengths(
+        st_intersects(
+          transactions_sf,
+          garden300
+        )
+      ) > 0
+    )
+
+  transactions_sf$control <-
+    as.integer(
+      lengths(
+        st_intersects(
+          transactions_sf,
+          control_ring
+        )
+      ) > 0
+    )
+  
+  treated_join <- st_join(
+    transactions_sf,
+    garden300[, c(
+      "id",
+      "opening_year",
+      "distinctive_name_1"
+    )]
+  )
+  
+  control_join <- st_join(
+    transactions_sf,
+    garden_ring[, c(
+      "id",
+      "opening_year",
+      "distinctive_name_1"
+    )]
+  )
+  
+  transactions_sf$garden_id <- treated_join$id
+  transactions_sf$opening_year <- treated_join$opening_year
+  transactions_sf$garden_name <- treated_join$"distinctive_name_1"
+  
+  missing_garden <- is.na(transactions_sf$garden_id)
+
+  transactions_sf$garden_id[missing_garden] <-
+    control_join$id[missing_garden]
+  
+  transactions_sf$opening_year[missing_garden] <-
+    control_join$opening_year[missing_garden]
+  
+  transactions_sf$garden_name[missing_garden] <-
+    control_join$distinctive_name_1[missing_garden]
+
+  return(transactions_sf)
+}
+```
+
+```{r choose_year}
+
+years <- 2000:2026
+
+all_years <- lapply(
+  years,
+  process_year
+)
+
+```
+
+```{r combine}
+transactions_all <- do.call(
+  rbind,
+  all_years
+)
+```
+
+```{r save}
+library(arrow)
+
+transactions_all_nogeo <- st_drop_geometry(
+  transactions_all
+)
+
+write_parquet(
+  transactions_all_nogeo,
+  "C:/LSE_GEOGRAPHY/GY_460/A1/transaction data/transactions_all.parquet"
+)
+```
+
+```{r create_sales_n_event_time}
+
+transactions_all$sale_year <-
+  lubridate::year(
+    as.Date(
+      transactions_all$transfer_date
+    )
+  )
+
+transactions_all$event_time <-
+  transactions_all$sale_year -
+  transactions_all$opening_year
+
+transactions_all <- transactions_all[
+  transactions_all$sale_year <= 2025,
+]
+```
+
+```{r keep_treated_control}
+
+analysis_data <- transactions_all[
+  transactions_all$treat300 == 1 |
+  transactions_all$control == 1,
+]
+
+analysis_data <- st_drop_geometry(
+  analysis_data
+)
+```
+
+```{r join_imd}
+library(readxl)
+imd <- read_excel(
+  "C:/Users/User/Downloads/File_1_-_IMD2019_Index_of_Multiple_Deprivation.xlsx",
+  sheet = 2
+)
+
+names(imd)
+
+imd <- imd |>
+  dplyr::select(
+    `LSOA code (2011)`,
+    `Index of Multiple Deprivation (IMD) Rank`,
+    `Index of Multiple Deprivation (IMD) Decile`
+  )
+
+DiD_dataset <- merge(
+  analysis_data,
+  imd,
+  by.x = "lsoa11",
+  by.y = "LSOA code (2011)",
+  all.x = TRUE
+)
+```
+
+```{r checks}
+sort(
+  table(DiD_dataset$garden_name),
+  decreasing = TRUE
+)
+
+garden_summary <- aggregate(
+  price ~ garden_name,
+  data = DiD_dataset,
+  FUN = length
+)
+
+names(garden_summary)[2] <- "n_transactions"
+
+garden_summary[
+  order(-garden_summary$n_transactions),
+]
+
+
+table(DiD_dataset$treat300)
+table(DiD_dataset$control)
+
+garden_treat_summary <-
+  aggregate(
+    treat300 ~ garden_name,
+    data = DiD_dataset,
+    FUN = function(x) c(
+      treated = sum(x == 1),
+      control = sum(x == 0)
+    )
+  )
+
+garden_treat_summary
+
+unique(
+  DiD_dataset[
+    ,
+    c(
+      "garden_name",
+      "opening_year"
+    )
+  ]
+)
+
+test2000 <- process_year(2000)
+
+table(
+  test2000$garden_name,
+  test2000$control
+)
+
+sapply(
+  st_intersects(garden_ring),
+  length
+)
+
+table(
+  lengths(
+    st_intersects(
+      garden_ring,
+      garden_ring
+    )
+  )
+)
+
+
+nrow(garden300)
+nrow(garden1000)
+nrow(garden_ring)
+
+
+
+summary(DiD_dataset$event_time)
+table(DiD_dataset$event_time)
+
+with(
+  DiD_dataset,
+  table(
+    garden_name,
+    sale_year < opening_year
+  )
+)
+```
+
+```{r Did}
+DiD_dataset$post <-
+  as.integer(
+    DiD_dataset$sale_year >=
+    DiD_dataset$opening_year
+  )
+
+table(
+  DiD_dataset$treat300,
+  DiD_dataset$post
+)
+
+DiD_dataset$log_price <-
+  log(DiD_dataset$price)
+
+names(DiD_dataset)[
+  names(DiD_dataset) ==
+    "Index of Multiple Deprivation (IMD) Rank"
+] <- "imd_rank"
+
+names(DiD_dataset)[
+  names(DiD_dataset) ==
+    "Index of Multiple Deprivation (IMD) Decile"
+] <- "imd_decile"
+```
+
+```{r model}
+library(fixest)
+
+did1 <- feols(
+  log_price ~
+    treat300 * post |
+    sale_year +
+    garden_id,
+  cluster = ~garden_id + lsoa11,
+  data = DiD_dataset
+)
+
+summary(did1)
+
+
+did2 <- feols(
+  log_price ~
+    treat300 * post +
+    imd_decile |
+    sale_year +
+    garden_id,
+  cluster = ~garden_id + lsoa11,
+  data = DiD_dataset
+)
+
+summary(did2)
+
+did3 <- feols(
+  log_price ~
+    treat300 * post +
+    imd_decile +
+    property_type +
+    duration |
+    sale_year +
+    garden_id,
+  cluster = ~garden_id + lsoa11,
+  data = DiD_dataset
+)
+
+summary(did2)
+
+etable(did1, did2, did3)
+```
+
+```{r Did3}
+did3 <- feols(
+  log_price ~
+    treat300 * post +
+    imd_decile +
+    property_type +
+    duration |
+    sale_year +
+    garden_id,
+  data = DiD_dataset
+)
+
+did3_garden <- feols(
+  log_price ~
+    treat300 * post +
+    imd_decile +
+    property_type +
+    duration |
+    sale_year +
+    garden_id,
+  cluster = ~garden_id,
+  data = DiD_dataset
+)
+
+did3_lsoa <- feols(
+  log_price ~
+    treat300 * post +
+    imd_decile +
+    property_type +
+    duration |
+    sale_year +
+    garden_id,
+  cluster = ~lsoa11,
+  data = DiD_dataset
+)
+
+did3_twc <- feols(
+  log_price ~
+    treat300 * post +
+    imd_decile +
+    property_type +
+    duration |
+    sale_year +
+    garden_id,
+  cluster = ~garden_id + lsoa11,
+  data = DiD_dataset
+)
+```
+
+```{r DiD_table}
+etable(
+  did3,
+  did3_garden,
+  did3_lsoa,
+  did3_twc,
+  headers = c(
+    "IID",
+    "Garden Cluster",
+    "LSOA Cluster",
+    "Two-Way Cluster"
+  )
+)
+```
+```{r event_study_3}
+es3 <- feols(
+  log_price ~
+    i(event_time, treat300, ref = -1) +
+    imd_decile +
+    property_type +
+    duration |
+    sale_year +
+    garden_id,
+  data = DiD_dataset
+)
+
+
+es3_garden <- feols(
+  log_price ~
+    i(event_time, treat300, ref = -1) +
+    imd_decile +
+    property_type +
+    duration |
+    sale_year +
+    garden_id,
+  cluster = ~garden_id,
+  data = DiD_dataset
+)
+
+es3_lsoa <- feols(
+  log_price ~
+    i(event_time, treat300, ref = -1) +
+    imd_decile +
+    property_type +
+    duration |
+    sale_year +
+    garden_id,
+  cluster = ~lsoa11,
+  data = DiD_dataset
+)
+
+es3_twc <- feols(
+  log_price ~
+    i(event_time, treat300, ref = -1) +
+    imd_decile +
+    property_type +
+    duration |
+    sale_year +
+    garden_id,
+  cluster = ~garden_id + lsoa11,
+  data = DiD_dataset
+)
+```
+
+
+```{r es_plot}
+iplot(
+  es3,
+  main = "Event Study: Community Garden Impact on House Prices",
+  xlab = "Years Relative to Garden Opening",
+  ylab = "Effect on Log Price (IID SEs)"
+)
+
+
+iplot(
+  es3_garden,
+  main = "Event Study: Community Garden Impact on House Prices",
+  xlab = "Years Relative to Garden Opening",
+  ylab = "Effect on Log Price (Garden-Clustered SEs)"
+)
+
+iplot(
+  es3_lsoa,
+  main = "Event Study: Community Garden Impact on House Prices",
+  xlab = "Years Relative to Garden Opening",
+  ylab = "Effect on Log Price (LSOA-Clustered SEs)"
+)
+
+iplot(
+  es3_twc,
+  main = "Event Study: Community Garden Impact on House Prices",
+  xlab = "Years Relative to Garden Opening",
+  ylab = "Effect on Log Price (Two-Way Clustered SEs)"
+)
+```
+
+```{r binned}
+DiD_dataset$event_time_bin <- pmax(
+  pmin(DiD_dataset$event_time, 15),
+  -15
+)
+
+es4 <- feols(
+  log_price ~
+    i(event_time_bin, treat300, ref = -1) +
+    imd_decile +
+    property_type +
+    duration |
+    sale_year + garden_id,
+  cluster = ~ garden_id + lsoa11,
+  data = DiD_dataset
+)
+
+iplot(
+  es4,
+  main = "Event Study: Community Garden Impact on House Prices",
+  xlab = "Years Relative to Garden Opening",
+  ylab = "Effect on Log Price (Two-Way Clustered SEs)"
+)
+```
+
+
+
+```{r event_study}
+es1 <- feols(
+  log_price ~
+    i(event_time, treat300, ref = -1) |
+    sale_year +
+    garden_id,
+  data = DiD_dataset
+)
+
+iplot(es1)
+
+```
+
+```{r}
+DiD_dataset$imd_decile <-
+  factor(DiD_dataset$imd_decile)
+
+es2 <- feols(
+  log_price ~
+    i(event_time, treat300, ref = -1) +
+    imd_decile |
+    sale_year +
+    garden_id,
+  cluster = ~garden_id,
+  data = DiD_dataset
+)
+
+iplot(es2)
+
+```
+
+```{r }
+etable(es1, es2)
+
+```
+
+```{r }
+png(
+  "C:/LSE_GEOGRAPHY/GY_460/A1/Images/event_study_es1.png",
+  width = 1600,
+  height = 1400,
+  res = 300
+)
+
+iplot(es1)
+
+dev.off()
+```
+
+```{r }
+png(
+  "C:/LSE_GEOGRAPHY/GY_460/A1/Images/event_study_es2.png",
+  width = 1600,
+  height = 1400,
+  res = 300
+)
+
+iplot(es2)
+
+dev.off()
+```
+
+```{r }
+etable(
+  did3,
+  did3_garden,
+  did3_lsoa,
+  did3_twc,
+  file = "C:/LSE_GEOGRAPHY/GY_460/A1/did_robustness.html"
+)
+
+```
+
+```{r }
+png(
+  "C:/LSE_GEOGRAPHY/GY_460/A1/Images/event_study_es3.png",
+  width = 1800,
+  height = 1200,
+  res = 300
+)
+
+iplot(
+  es3,
+  main = "Event Study: Community Garden Impact on House Prices",
+  xlab = "Years Relative to Garden Opening",
+  ylab = "Effect on Log Price (I.I.D Clustered SEs)"
+)
+
+dev.off()
+```
+
+```{r }
+png(
+  "C:/LSE_GEOGRAPHY/GY_460/A1/Images/event_study_es3_garden.png",
+  width = 1800,
+  height = 1200,
+  res = 300
+)
+
+iplot(
+  es3_garden,
+  main = "Event Study: Community Garden Impact on House Prices",
+  xlab = "Years Relative to Garden Opening",
+  ylab = "Effect on Log Price (Garden Clustered SEs)"
+)
+
+dev.off()
+```
+
+```{r }
+png(
+  "C:/LSE_GEOGRAPHY/GY_460/A1/Images/event_study_es3_lsoa.png",
+  width = 1800,
+  height = 1200,
+  res = 300
+)
+
+iplot(
+  es3_lsoa,
+  main = "Event Study: Community Garden Impact on House Prices",
+  xlab = "Years Relative to Garden Opening",
+  ylab = "Effect on Log Price (LSOA Clustered SEs)"
+)
+
+dev.off()
+```
+
+```{r }
+png(
+  "C:/LSE_GEOGRAPHY/GY_460/A1/Images/event_study_es3_twc.png",
+  width = 1800,
+  height = 1200,
+  res = 300
+)
+
+iplot(
+  es3_twc,
+  main = "Event Study: Community Garden Impact on House Prices",
+  xlab = "Years Relative to Garden Opening",
+  ylab = "Effect on Log Price (Two-Way Clustered SEs)"
+)
+
+dev.off()
+```
+
